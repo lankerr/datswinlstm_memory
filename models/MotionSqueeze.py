@@ -1,8 +1,28 @@
 import torch
 import torch.nn as nn
-from spatial_correlation_sampler import SpatialCorrelationSampler
+try:
+    from spatial_correlation_sampler import SpatialCorrelationSampler
+    HAS_SPATIAL_CORRELATION_SAMPLER = True
+except ImportError:
+    HAS_SPATIAL_CORRELATION_SAMPLER = False
+    print("Warning: spatial_correlation_sampler not available, using pure PyTorch fallback")
 import torch.nn.functional as F
 
+
+
+import sys
+import os
+# Add parent directory to path for visualization_utils import
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    import visualization_utils as vis_utils
+except ImportError:
+    # Create a dummy module if not available
+    class DummyVisUtils:
+        VISUALIZE = False
+        def plot_optical_flow(self, *args, **kwargs):
+            pass
+    vis_utils = DummyVisUtils()
 
 class MS(nn.Module):   # # Multi-scale Temporal Dynamics Module
 ## https://github.com/yzfly/TCM/blob/main/TCM.py
@@ -15,10 +35,14 @@ class MS(nn.Module):   # # Multi-scale Temporal Dynamics Module
         self.expansion = expansion
         self.c_out = c_out
         
-        self.matching_layer = Matching_layer(ks=1, patch=self.patch, stride=1, pad=0, patch_dilation=self.patch_dilation)   
-        # self.matching_layer = Matching_layer_mm(patch=self.patch)   
+        # Use pure PyTorch implementation if SpatialCorrelationSampler not available
+        if HAS_SPATIAL_CORRELATION_SAMPLER:
+            self.matching_layer = Matching_layer(ks=1, patch=self.patch, stride=1, pad=0, patch_dilation=self.patch_dilation)
+        else:
+            self.matching_layer = Matching_layer_mm(patch=self.patch)
         
         self.c1 = 16
+
         self.c2 = 32
         self.c3 = 64
         self.flow_refine_conv1 = nn.Sequential(
@@ -160,6 +184,9 @@ class MS(nn.Module):   # # Multi-scale Temporal Dynamics Module
         u, v, confidence = self.match_to_flow_soft(match, k, h, w, temperature) # u/v:b,1,h*w
         flow = torch.cat([u,v], dim=1).view(-1, 2*k, h, w)  #  (b, 2, h, w)  
     
+        if vis_utils.VISUALIZE:
+            vis_utils.plot_optical_flow(flow, name=f"ms_flow_pos{pos}")
+
         return flow, confidence
 
     def forward(self,x):

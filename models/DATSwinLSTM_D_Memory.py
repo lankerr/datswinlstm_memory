@@ -5,6 +5,15 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from .MotionSqueeze import MS
 import torch.utils.checkpoint as checkpoint
 from .dat_blocks import DATSwinLayer,DATSwinTransformerBlock
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    import visualization_utils as vis_utils
+except ImportError:
+    class DummyVisUtils:
+        VISUALIZE = False
+    vis_utils = DummyVisUtils()
 
 ## input: (b,c_in,t,h,w)
 ## output:(b,memory_size,48,48)
@@ -150,15 +159,49 @@ class Memory(nn.Module):
         self.long_len = long_len
         self.motion_encoder_2d = MotionEncoder2D(in_len=self.short_len,out_c=self.memory_size)
         self.motion_context_encoder_2d = MotionEncoder2D(in_len=self.long_len,out_c=self.memory_size)
-        # self.pool_memory_bank = nn.AdaptiveAvgPool2d([1,1])
-        self.pos_embedding = nn.Parameter(torch.randn(1, 6*6,self.memory_size))
-        self.additional_linear = nn.Linear(self.memory_size,512)
-        self.embedder = nn.Sequential(
-            PatchExpanding(input_resolution=[6,6], dim=512, dim_scale=2),
-            PatchExpanding(input_resolution=[12,12], dim=256, dim_scale=2),
-            PatchExpanding(input_resolution=[24,24], dim=128, dim_scale=2),
-            nn.Linear(64,256),
-)
+        
+        # [修复] 动态计算维度，不再硬编码
+        num_layers = len(args.depths_down)
+        # SwinLSTM 最后一层 cell 的 hidden state 维度
+        # 注意：每层经过 PatchMerging 后维度翻倍，但 cell 返回的是 merging 前的维度
+        # 所以最后一层的 hidden dim = embed_dim * 2^(num_layers-1)
+        self.hidden_dim = args.embed_dim * (2 ** (num_layers - 1))  # 如 embed_dim=128, num_layers=2 -> 256
+        
+        # MotionEncoder2D 输出分辨率: img_size / 32 / 2 / 1 = img_size / 64
+        # 对于 384x384: 384/64=6, 输出 6x6
+        self.motion_spatial_size = args.input_img_size // 64
+        self.motion_seq_len = self.motion_spatial_size * self.motion_spatial_size
+        
+        # SwinLSTM 下采样后的分辨率
+        # patches_resolution = img_size / patch_size, 然后每层 /2
+        patches_per_side = args.input_img_size // args.patch_size  # 如 384/4=96
+        # states_down[-1] 是在最后一层的 PatchMerging 前，所以分辨率是 /2^(num_layers-1)
+        self.swin_spatial_size = patches_per_side // (2 ** (num_layers - 1))  # 如 96/2=48
+        self.swin_seq_len = self.swin_spatial_size * self.swin_spatial_size  # 如 48*48=2304
+        
+        # pos_embedding 匹配 motion encoder 输出
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.motion_seq_len, self.memory_size))
+        
+        # additional_linear: 将 memory_size 映射到合适大小用于后续处理
+        self.additional_linear = nn.Linear(self.memory_size, 512)  # 固定为 512 用于 embedder
+        
+        # embedder: 从 motion_spatial_size 扩展到 swin_spatial_size
+        # 输出维度映射到 hidden_dim 以便与 states_down[-1] 匹配
+        embedder_layers = []
+        current_res = self.motion_spatial_size  # 6
+        current_dim = 512  # additional_linear 的输出
+        target_res = self.swin_spatial_size  # 48
+        
+        while current_res < target_res:
+            embedder_layers.append(PatchExpanding(input_resolution=[current_res, current_res], 
+                                                   dim=current_dim, dim_scale=2))
+            current_res *= 2
+            current_dim //= 2
+        
+        # 最终映射到 hidden_dim (与 states_down[-1][1] 的通道数相同)
+        embedder_layers.append(nn.Linear(current_dim, self.hidden_dim))
+        self.embedder = nn.Sequential(*embedder_layers)
+        self.matched_memory_dim = self.hidden_dim
 
         self.attention_block = Transformer(dim=self.memory_size, depth=1, heads=8, dim_head=64, mlp_dim=self.memory_size, dropout = 0.1)
 
@@ -168,20 +211,22 @@ class Memory(nn.Module):
                          num_heads=args.heads_number, window_size=args.window_size)
 
         self.target_len = args.out_len    
-        # self.memory_bank = nn.Parameter(torch.rand(memory_size,12,12))
         self.memory_shape = [self.memory_slot_size,self.memory_size]
         self.memory_bank = nn.init.uniform_(torch.empty(self.memory_shape), a=0.0, b=1.0)
         self.memory_bank = nn.Parameter(self.memory_bank, requires_grad=True)
-        ## matched_memory与h_t,c_t融合
-        self.attention_size = 256
+        
+        # [修复] attention_func 输入维度: hidden_dim + matched_memory_dim = 2 * hidden_dim
+        self.attention_input_dim = self.hidden_dim + self.matched_memory_dim  # 256 + 256 = 512
+        self.attention_size = self.hidden_dim
         self.attention_func = nn.Sequential(
-            # nn.AdaptiveAvgPool2d([1, 1]),
-            # nn.Flatten(),
-            nn.Linear(512, 16),
+            nn.Linear(self.attention_input_dim, 16),
             nn.ReLU(inplace=True),
             nn.Linear(16, self.attention_size),
-            nn.Sigmoid())            
-        self.fuse = nn.Linear(512,256)
+            nn.Sigmoid())
+        
+        # [修复] fuse 输入维度: hidden_dim + matched_memory_dim = 2 * hidden_dim
+        # fuse 输出维度: hidden_dim (保持与 states_down 一致)
+        self.fuse = nn.Linear(self.hidden_dim + self.matched_memory_dim, self.hidden_dim)
 
     def forward(self,inputs,memory_x,phase):
         ## 不考虑像素值<31的
@@ -199,9 +244,11 @@ class Memory(nn.Module):
 
         memory_query += self.pos_embedding
         matched_memory = self.attention_block(memory_query,memory_bank,memory_bank)
-        if not matched_memory.shape[-1] == 512:
+        # [修复] 使用动态维度而不是硬编码 512
+        if not matched_memory.shape[-1] == self.hidden_dim:
             matched_memory = self.additional_linear(matched_memory)
         matched_memory = self.embedder(matched_memory)
+        
         ## matched_memory与h_t,c_t融合
         outputs = []
         inputs_len = inputs.shape[1]
@@ -215,15 +262,52 @@ class Memory(nn.Module):
             output, states_down, states_up = self.predictor(inputs[:, i], states_down, states_up)
             outputs.append(output)
 
-        for i in range(self.target_len):
+        # [修复] 在循环开始前，先获取第一个状态来确定目标尺寸
+        # 先做一次前向传播获取 states_down 的形状信息
+        output, states_down, states_up = self.predictor(last_input, states_down, states_up)
+        outputs.append(output)
+        last_input = output
+        
+        # 计算 matched_memory 需要的目标分辨率（只计算一次）
+        state_seq_len = states_down[-1][1].shape[1]
+        memory_seq_len = matched_memory.shape[1]
+        
+        if memory_seq_len != state_seq_len:
+            # 使用插值调整空间分辨率
+            B, L, C = matched_memory.shape
+            H = W = int(L ** 0.5)
+            matched_memory_2d = matched_memory.view(B, H, W, C).permute(0, 3, 1, 2)
+            target_H = target_W = int(state_seq_len ** 0.5)
+            matched_memory_2d = torch.nn.functional.interpolate(
+                matched_memory_2d, size=(target_H, target_W), mode='bilinear', align_corners=False
+            )
+            matched_memory = matched_memory_2d.permute(0, 2, 3, 1).view(B, -1, C)
+        
+        # 第一步的注意力融合
+        attention = self.attention_func(torch.cat([states_down[-1][1], matched_memory], dim=2))
+        memory_feature_att = matched_memory * attention
+        tmp = torch.cat((states_down[-1][1], memory_feature_att), 2)
+        states_down[-1][1] = self.fuse(tmp)
+
+        # 剩余步骤
+        for i in range(1, self.target_len):
             output, states_down, states_up = self.predictor(last_input, states_down, states_up)
             outputs.append(output)
-            last_input = output          
+            last_input = output
+            
             attention = self.attention_func(torch.cat([states_down[-1][1], matched_memory], dim=2))
+            
+            if vis_utils.VISUALIZE:
+                 pass # Skip for now as shape is ambiguous without running.
+            
             memory_feature_att = matched_memory * attention
             tmp = torch.cat((states_down[-1][1],memory_feature_att),2)
             states_down[-1][1] = self.fuse(tmp)        
         return outputs
+    
+    def set_memory_bank_requires_grad(self, requires_grad: bool):
+        """设置 memory_bank 的梯度需求"""
+        self.memory_bank.requires_grad = requires_grad
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):

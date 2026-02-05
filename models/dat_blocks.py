@@ -6,6 +6,17 @@ import torch.utils.checkpoint as checkpoint
 import einops
 import numpy as np
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    import visualization_utils as vis_utils
+except ImportError:
+    class DummyVisUtils:
+        VISUALIZE = False
+        def plot_deformable_offsets(self, *args, **kwargs):
+            pass
+    vis_utils = DummyVisUtils()
 
 # ------------------------------
 # DATransformer Basic
@@ -404,6 +415,9 @@ class DATSwinDAttention(nn.Module):
         out = out.reshape(B, C, H, W)
 
         y = self.proj_drop(self.proj_out(out))
+
+        if vis_utils.VISUALIZE:
+            vis_utils.plot_deformable_offsets(pos, reference, name="dat_swin_offsets")
 
         return y,pos.reshape(B, self.n_group, Hk, Wk, 2), reference.reshape(B, self.n_group, Hk, Wk, 2)#, 0, 0, 0
 
